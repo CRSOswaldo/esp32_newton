@@ -1,306 +1,341 @@
 """
-Ley de Newton del Enfriamiento - Backend
-========================================
-- Recibe datos del ESP32 por HTTP POST
-- Calcula dT/dt
-- Ajusta el modelo de Newton periódicamente
-- Retransmite en tiempo real por WebSocket
-- Permite descargar CSV de la sesión actual
-- Permite cargar CSV históricos para graficar
+Ley de Newton del Enfriamiento - Streamlit
+==========================================
+- Lee datos en tiempo real desde Supabase (escritos por el ESP32)
+- Gráfica interactiva con Plotly
+- Descarga CSV de la sesión
+- Carga de CSV históricos
+- Ajuste automático del modelo de Newton
 """
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
-from collections import deque
-from datetime import datetime
+import streamlit as st
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import pandas as pd
 import numpy as np
 from scipy.optimize import curve_fit
-import csv
+from datetime import datetime
+import time
 import io
-import asyncio
-import json
 import os
-from typing import List, Optional
 
 # ============ CONFIGURACIÓN ============
-MAX_PUNTOS = 2000
-INTERVALO_AJUSTE = 60.0          # segundos entre ajustes del modelo
+# Estas variables se configuran en Streamlit Cloud → Settings → Secrets
+# O localmente en .streamlit/secrets.toml
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
+TABLA = "temperaturas"
+REFRESH_SEGUNDOS = 2          # cada cuántos segundos refrescar
+INTERVALO_AJUSTE = 60         # segundos entre ajustes del modelo
 # =======================================
 
-# Ruta base = carpeta donde está este archivo .py
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMPLATES_DIR = os.path.join(BASE_DIR, "templates")
-
-app = FastAPI(title="Ley de Newton - Tiempo Real")
-templates = Jinja2Templates(directory=TEMPLATES_DIR)
-
-# ---------- Estado en memoria ----------
-class Estado:
-    def __init__(self):
-        self.tiempos = deque(maxlen=MAX_PUNTOS)
-        self.temps_agua = deque(maxlen=MAX_PUNTOS)
-        self.temps_ambiente = deque(maxlen=MAX_PUNTOS)
-        self.derivadas = deque(maxlen=MAX_PUNTOS)
-        self.ultimo_ajuste = 0.0
-        self.parametros = None          # (T0, k)
-        self.Ta_usada = None
-        self.tiempo_inicio = None
-        self.clientes: List[WebSocket] = []
-
-estado = Estado()
+st.set_page_config(
+    page_title="Ley de Newton – Tiempo Real",
+    page_icon="🌡️",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 # ---------- Modelo de Newton ----------
 def modelo_newton(t, T0, k, Ta):
     return Ta + (T0 - Ta) * np.exp(-k * t)
 
-def ajustar_modelo():
-    if len(estado.tiempos) < 8:
+def ajustar_modelo(df):
+    """Ajusta T0 y k manteniendo Ta como promedio del ambiente"""
+    if len(df) < 8:
         return None
     try:
-        t_data = np.array(estado.tiempos)
-        T_data = np.array(estado.temps_agua)
-        Ta = float(np.mean(estado.temps_ambiente))
+        t = df["t"].values
+        T = df["agua"].values
+        Ta = float(df["amb"].mean())
 
-        def modelo_fijo(t, T0, k):
+        def f(t, T0, k):
             return modelo_newton(t, T0, k, Ta)
 
         popt, _ = curve_fit(
-            modelo_fijo,
-            t_data,
-            T_data,
-            p0=[T_data[0], 0.01],
+            f, t, T,
+            p0=[T[0], 0.01],
             bounds=([0, 1e-5], [150, 1.0]),
-            maxfev=2000
+            maxfev=3000
         )
-        estado.parametros = popt
-        estado.Ta_usada = Ta
-        estado.ultimo_ajuste = t_data[-1]
         return {
             "T0": round(float(popt[0]), 2),
             "k": round(float(popt[1]), 5),
             "Ta": round(Ta, 2)
         }
-    except Exception as e:
-        print(f"Error ajuste: {e}")
+    except Exception:
         return None
 
-# ---------- WebSocket manager ----------
-async def broadcast(mensaje: dict):
-    muertos = []
-    for ws in estado.clientes:
-        try:
-            await ws.send_json(mensaje)
-        except Exception:
-            muertos.append(ws)
-    for ws in muertos:
-        if ws in estado.clientes:
-            estado.clientes.remove(ws)
+def generar_curva(modelo, t_max):
+    if modelo is None:
+        return None, None
+    t = np.linspace(0, t_max + 30, 200)
+    T = modelo_newton(t, modelo["T0"], modelo["k"], modelo["Ta"])
+    return t, T
 
-# ---------- Modelos Pydantic ----------
-class DatoESP32(BaseModel):
-    t: float                # tiempo en segundos desde el inicio del ESP32
-    agua: float             # temperatura del agua
-    amb: float              # temperatura ambiente
+# ---------- Conexión Supabase ----------
+@st.cache_resource
+def get_supabase():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    from supabase import create_client
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# ---------- Rutas ----------
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+def leer_datos_supabase(limit=2000):
+    sb = get_supabase()
+    if sb is None:
+        return pd.DataFrame(columns=["t", "agua", "amb", "created_at"])
+    try:
+        res = sb.table(TABLA).select("t, agua, amb, created_at") \
+                 .order("t", desc=False) \
+                 .limit(limit) \
+                 .execute()
+        df = pd.DataFrame(res.data)
+        if df.empty:
+            return pd.DataFrame(columns=["t", "agua", "amb", "created_at"])
+        df["t"] = pd.to_numeric(df["t"], errors="coerce")
+        df["agua"] = pd.to_numeric(df["agua"], errors="coerce")
+        df["amb"] = pd.to_numeric(df["amb"], errors="coerce")
+        df = df.dropna(subset=["t", "agua", "amb"])
+        return df
+    except Exception as e:
+        st.error(f"Error leyendo Supabase: {e}")
+        return pd.DataFrame(columns=["t", "agua", "amb", "created_at"])
 
-@app.post("/api/data")
-async def recibir_dato(dato: DatoESP32):
-    """Endpoint que llama el ESP32 cada segundo"""
-    t = dato.t
-    agua = dato.agua
-    amb = dato.amb
+def calcular_dTdt(df):
+    if len(df) < 2:
+        df = df.copy()
+        df["dTdt"] = 0.0
+        return df
+    df = df.copy()
+    dt = df["t"].diff()
+    dT = df["agua"].diff()
+    df["dTdt"] = np.where(dt > 0, dT / dt, 0.0)
+    df["dTdt"] = df["dTdt"].fillna(0.0)
+    return df
 
-    # Primera muestra → guardar tiempo de inicio de sesión
-    if estado.tiempo_inicio is None:
-        estado.tiempo_inicio = datetime.now()
+def normalizar_tiempo(df):
+    """Hace que el tiempo empiece en 0 s (útil tras reiniciar la sesión)."""
+    if df.empty or "t" not in df.columns:
+        return df
+    df = df.copy()
+    df["t"] = df["t"] - df["t"].min()
+    return df
 
-    # Calcular dT/dt
-    if len(estado.temps_agua) >= 1:
-        dt = t - estado.tiempos[-1]
-        dT = agua - estado.temps_agua[-1]
-        dTdt = dT / dt if dt > 0 else 0.0
-    else:
-        dTdt = 0.0
+def borrar_datos_supabase():
+    """Elimina todos los registros de la tabla de temperaturas."""
+    sb = get_supabase()
+    if sb is None:
+        return False, "No hay conexión a Supabase"
+    try:
+        # Borra todas las filas (filtro que siempre es verdadero)
+        sb.table(TABLA).delete().neq("id", -1).execute()
+        return True, "Datos borrados correctamente"
+    except Exception as e:
+        return False, str(e)
 
-    estado.tiempos.append(t)
-    estado.temps_agua.append(agua)
-    estado.temps_ambiente.append(amb)
-    estado.derivadas.append(dTdt)
+# ---------- UI ----------
+st.title("🌡️ Ley de Newton del Enfriamiento")
+st.caption("Dos sensores DS18B20 · ESP32 · Datos en la nube · Visible desde cualquier red")
 
-    # Ajuste periódico
-    modelo_info = None
-    if t - estado.ultimo_ajuste >= INTERVALO_AJUSTE:
-        modelo_info = ajustar_modelo()
-
-    # Payload para los clientes web
-    payload = {
-        "tipo": "dato",
-        "t": round(t, 1),
-        "agua": round(agua, 2),
-        "amb": round(amb, 2),
-        "dTdt": round(dTdt, 4),
-        "modelo": modelo_info
-    }
-
-    # Si hay modelo actual, también enviar la curva teórica
-    if estado.parametros is not None and estado.Ta_usada is not None:
-        t0, k = estado.parametros
-        t_max = max(estado.tiempos) + 30
-        t_teorico = np.linspace(0, t_max, 150)
-        T_teorico = modelo_newton(t_teorico, t0, k, estado.Ta_usada)
-        payload["curva"] = {
-            "t": [round(float(x), 1) for x in t_teorico],
-            "T": [round(float(x), 2) for x in T_teorico]
-        }
-
-    await broadcast(payload)
-    return {"status": "ok"}
-
-@app.get("/api/estado")
-async def obtener_estado():
-    """Devuelve todo el historial actual (útil al conectar un cliente nuevo)"""
-    modelo = None
-    if estado.parametros is not None:
-        modelo = {
-            "T0": round(float(estado.parametros[0]), 2),
-            "k": round(float(estado.parametros[1]), 5),
-            "Ta": round(estado.Ta_usada, 2)
-        }
-    return {
-        "tiempos": list(estado.tiempos),
-        "agua": list(estado.temps_agua),
-        "amb": list(estado.temps_ambiente),
-        "dTdt": list(estado.derivadas),
-        "modelo": modelo
-    }
-
-@app.get("/api/download")
-async def descargar_csv():
-    """Descarga el CSV de la sesión actual"""
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Tiempo_seg", "Temp_Agua_C", "Temp_Ambiente_C", "dT_dt"])
-    for t, a, amb, d in zip(estado.tiempos, estado.temps_agua,
-                            estado.temps_ambiente, estado.derivadas):
-        writer.writerow([f"{t:.1f}", f"{a:.2f}", f"{amb:.2f}", f"{d:.4f}"])
-
-    output.seek(0)
-    nombre = f"newton_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    return StreamingResponse(
-        iter([output.getvalue()]),
-        media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename={nombre}"}
+# Sidebar
+with st.sidebar:
+    st.header("Controles")
+    modo = st.radio(
+        "Modo de visualización",
+        ["Tiempo real (Supabase)", "Cargar CSV histórico"],
+        index=0
     )
 
-@app.post("/api/upload")
-async def cargar_csv(file: UploadFile = File(...)):
-    """Carga un CSV histórico y lo devuelve parseado para graficar"""
-    contenido = await file.read()
-    texto = contenido.decode("utf-8")
-    reader = csv.DictReader(io.StringIO(texto))
+    st.divider()
+    auto_refresh = st.checkbox("Auto-refresco", value=True)
+    if auto_refresh and modo.startswith("Tiempo real"):
+        st.caption(f"Actualizando cada {REFRESH_SEGUNDOS} s")
 
-    tiempos, agua, amb, dTdt = [], [], [], []
-    for row in reader:
-        # Soporta diferentes nombres de columnas
-        t = float(row.get("Tiempo_seg") or row.get("Tiempo_min") or row.get("t") or list(row.values())[0])
-        a = float(row.get("Temp_Agua_C") or row.get("agua") or list(row.values())[1])
-        am = float(row.get("Temp_Ambiente_C") or row.get("amb") or list(row.values())[2])
-        d = float(row.get("dT_dt") or row.get("dTdt") or (list(row.values())[3] if len(row) > 3 else 0))
-        tiempos.append(t)
-        agua.append(a)
-        amb.append(am)
-        dTdt.append(d)
+    st.divider()
+    st.subheader("Sesión actual")
+    if st.button("🔄 Forzar actualización"):
+        st.rerun()
 
-    # Intentar ajustar modelo también sobre datos históricos
-    modelo = None
-    if len(tiempos) >= 8:
-        try:
-            t_data = np.array(tiempos)
-            T_data = np.array(agua)
-            Ta = float(np.mean(amb))
-            def modelo_fijo(t, T0, k):
-                return modelo_newton(t, T0, k, Ta)
-            popt, _ = curve_fit(modelo_fijo, t_data, T_data,
-                                p0=[T_data[0], 0.01],
-                                bounds=([0, 1e-5], [150, 1.0]))
-            modelo = {
-                "T0": round(float(popt[0]), 2),
-                "k": round(float(popt[1]), 5),
-                "Ta": round(Ta, 2)
-            }
-            t_teorico = np.linspace(t_data[0], t_data[-1] + 30, 150)
-            T_teorico = modelo_newton(t_teorico, popt[0], popt[1], Ta)
-            curva = {
-                "t": [round(float(x), 1) for x in t_teorico],
-                "T": [round(float(x), 2) for x in T_teorico]
-            }
-        except Exception:
-            curva = None
+    st.divider()
+    st.subheader("Reiniciar experimento")
+    st.caption("Borra todos los puntos de la gráfica y deja el contador listo para empezar de 0 s.")
+    confirmar = st.checkbox("Confirmo que quiero borrar los datos")
+    if st.button("🗑️ Reiniciar datos (volver a 0 s)", type="primary", disabled=not confirmar):
+        ok, msg = borrar_datos_supabase()
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(f"No se pudo borrar: {msg}")
+            st.info(
+                "Si falla, añade esta política en Supabase → SQL Editor:\n\n"
+                "```sql\n"
+                'create policy "Permitir borrar" on temperaturas\n'
+                "  for delete using (true);\n"
+                "```"
+            )
+
+# ---------- Modo Tiempo Real ----------
+if modo.startswith("Tiempo real"):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        st.warning(
+            "⚠️ Faltan las credenciales de Supabase.\n\n"
+            "Ve a **Streamlit Cloud → Settings → Secrets** y agrega:\n\n"
+            "```toml\n"
+            'SUPABASE_URL = "https://xxxxx.supabase.co"\n'
+            'SUPABASE_KEY = "eyJhbGciOi..."\n'
+            "```"
+        )
+        st.info("Mientras tanto puedes usar el modo **Cargar CSV histórico**.")
+        df = pd.DataFrame()
     else:
-        curva = None
+        df = leer_datos_supabase()
+        df = normalizar_tiempo(df)   # el eje X siempre empieza en 0 s
+        df = calcular_dTdt(df)
 
-    return {
-        "tiempos": tiempos,
-        "agua": agua,
-        "amb": amb,
-        "dTdt": dTdt,
-        "modelo": modelo,
-        "curva": curva
-    }
+    if df.empty:
+        st.info("Esperando datos del ESP32… Asegúrate de que el ESP32 esté enviando a Supabase.")
+    else:
+        # Valores actuales
+        ultimo = df.iloc[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tiempo", f"{ultimo['t']:.1f} s")
+        c2.metric("Temp. Agua", f"{ultimo['agua']:.2f} °C")
+        c3.metric("Temp. Ambiente", f"{ultimo['amb']:.2f} °C")
+        c4.metric("dT/dt", f"{ultimo['dTdt']:.4f} °C/s")
 
-@app.post("/api/reset")
-async def reset_sesion():
-    """Reinicia los buffers de la sesión actual"""
-    estado.tiempos.clear()
-    estado.temps_agua.clear()
-    estado.temps_ambiente.clear()
-    estado.derivadas.clear()
-    estado.ultimo_ajuste = 0.0
-    estado.parametros = None
-    estado.Ta_usada = None
-    estado.tiempo_inicio = None
-    await broadcast({"tipo": "reset"})
-    return {"status": "ok"}
+        # Ajuste del modelo
+        modelo = ajustar_modelo(df)
+        if modelo:
+            st.success(
+                f"**Modelo de Newton** →  "
+                f"T₀ = {modelo['T0']} °C   |   "
+                f"Tₐ = {modelo['Ta']} °C   |   "
+                f"k = {modelo['k']} s⁻¹"
+            )
+            st.latex(r"T(t) = T_a + (T_0 - T_a)\, e^{-k\, t}")
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    estado.clientes.append(websocket)
-    print(f"Cliente conectado. Total: {len(estado.clientes)}")
+        # Gráfica
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        fig.add_trace(
+            go.Scatter(x=df["t"], y=df["agua"], name="Temp. Agua",
+                       line=dict(color="#38bdf8", width=2.5)),
+            secondary_y=False
+        )
+        fig.add_trace(
+            go.Scatter(x=df["t"], y=df["amb"], name="Temp. Ambiente",
+                       line=dict(color="#94a3b8", width=1.8)),
+            secondary_y=False
+        )
+        if modelo:
+            t_c, T_c = generar_curva(modelo, df["t"].max())
+            fig.add_trace(
+                go.Scatter(x=t_c, y=T_c, name="Modelo Newton",
+                           line=dict(color="#f87171", width=2, dash="dash")),
+                secondary_y=False
+            )
+        fig.add_trace(
+            go.Scatter(x=df["t"], y=df["dTdt"], name="dT/dt",
+                       line=dict(color="#4ade80", width=1.5)),
+            secondary_y=True
+        )
+        fig.update_layout(
+            height=520,
+            margin=dict(t=30, b=40, l=50, r=50),
+            legend=dict(orientation="h", y=1.12),
+            hovermode="x unified",
+            template="plotly_dark"
+        )
+        fig.update_xaxes(title_text="Tiempo (s)")
+        fig.update_yaxes(title_text="Temperatura (°C)", secondary_y=False)
+        fig.update_yaxes(title_text="dT/dt (°C/s)", secondary_y=True)
+        st.plotly_chart(fig, use_container_width=True)
 
-    # Enviar estado actual al conectar
-    try:
-        await websocket.send_json({
-            "tipo": "estado_inicial",
-            "tiempos": list(estado.tiempos),
-            "agua": list(estado.temps_agua),
-            "amb": list(estado.temps_ambiente),
-            "dTdt": list(estado.derivadas),
-            "modelo": {
-                "T0": round(float(estado.parametros[0]), 2),
-                "k": round(float(estado.parametros[1]), 5),
-                "Ta": round(estado.Ta_usada, 2)
-            } if estado.parametros is not None else None
-        })
-    except Exception:
-        pass
+        # Descarga CSV
+        csv_buf = io.StringIO()
+        df_out = df[["t", "agua", "amb", "dTdt"]].copy()
+        df_out.columns = ["Tiempo_seg", "Temp_Agua_C", "Temp_Ambiente_C", "dT_dt"]
+        df_out.to_csv(csv_buf, index=False)
+        st.download_button(
+            label="⬇ Descargar CSV de la sesión",
+            data=csv_buf.getvalue(),
+            file_name=f"newton_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            mime="text/csv"
+        )
 
-    try:
-        while True:
-            # Mantener la conexión viva (el cliente puede enviar pings)
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        if websocket in estado.clientes:
-            estado.clientes.remove(websocket)
-        print(f"Cliente desconectado. Total: {len(estado.clientes)}")
+    # Auto-refresh
+    if auto_refresh and not df.empty:
+        time.sleep(REFRESH_SEGUNDOS)
+        st.rerun()
 
-# ---------- Arranque ----------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
+# ---------- Modo Histórico ----------
+else:
+    st.subheader("📂 Cargar datos históricos")
+    archivo = st.file_uploader("Selecciona un archivo CSV", type=["csv"])
+
+    if archivo is not None:
+        try:
+            df = pd.read_csv(archivo)
+            # Normalizar nombres de columnas
+            colmap = {}
+            for c in df.columns:
+                cl = c.lower().strip()
+                if "tiempo" in cl or cl == "t":
+                    colmap[c] = "t"
+                elif "agua" in cl:
+                    colmap[c] = "agua"
+                elif "amb" in cl:
+                    colmap[c] = "amb"
+                elif "dt" in cl or "deriv" in cl:
+                    colmap[c] = "dTdt"
+            df = df.rename(columns=colmap)
+
+            if "dTdt" not in df.columns:
+                df = calcular_dTdt(df)
+
+            required = {"t", "agua", "amb"}
+            if not required.issubset(df.columns):
+                st.error(f"El CSV debe tener columnas de tiempo, temperatura de agua y ambiente. Encontradas: {list(df.columns)}")
+            else:
+                st.success(f"Cargados {len(df)} puntos")
+
+                ultimo = df.iloc[-1]
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Tiempo", f"{ultimo['t']:.1f} s")
+                c2.metric("Temp. Agua", f"{ultimo['agua']:.2f} °C")
+                c3.metric("Temp. Ambiente", f"{ultimo['amb']:.2f} °C")
+                c4.metric("dT/dt", f"{ultimo.get('dTdt', 0):.4f} °C/s")
+
+                modelo = ajustar_modelo(df)
+                if modelo:
+                    st.success(
+                        f"**Modelo de Newton** →  "
+                        f"T₀ = {modelo['T0']} °C   |   "
+                        f"Tₐ = {modelo['Ta']} °C   |   "
+                        f"k = {modelo['k']} s⁻¹"
+                    )
+
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_trace(go.Scatter(x=df["t"], y=df["agua"], name="Temp. Agua",
+                                         line=dict(color="#38bdf8", width=2.5)), secondary_y=False)
+                fig.add_trace(go.Scatter(x=df["t"], y=df["amb"], name="Temp. Ambiente",
+                                         line=dict(color="#94a3b8", width=1.8)), secondary_y=False)
+                if modelo:
+                    t_c, T_c = generar_curva(modelo, df["t"].max())
+                    fig.add_trace(go.Scatter(x=t_c, y=T_c, name="Modelo Newton",
+                                             line=dict(color="#f87171", width=2, dash="dash")), secondary_y=False)
+                if "dTdt" in df.columns:
+                    fig.add_trace(go.Scatter(x=df["t"], y=df["dTdt"], name="dT/dt",
+                                             line=dict(color="#4ade80", width=1.5)), secondary_y=True)
+                fig.update_layout(height=520, template="plotly_dark",
+                                  legend=dict(orientation="h", y=1.12), hovermode="x unified")
+                fig.update_xaxes(title_text="Tiempo (s)")
+                fig.update_yaxes(title_text="Temperatura (°C)", secondary_y=False)
+                fig.update_yaxes(title_text="dT/dt (°C/s)", secondary_y=True)
+                st.plotly_chart(fig, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"No se pudo leer el archivo: {e}")
+    else:
+        st.info("Sube un CSV con columnas: Tiempo_seg, Temp_Agua_C, Temp_Ambiente_C (y opcionalmente dT_dt)")
