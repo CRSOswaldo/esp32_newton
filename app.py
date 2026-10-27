@@ -97,7 +97,10 @@ def leer_datos_supabase(limit=2000):
         df["agua"] = pd.to_numeric(df["agua"], errors="coerce")
         df["amb"] = pd.to_numeric(df["amb"], errors="coerce")
         df = df.dropna(subset=["t", "agua", "amb"])
-        return df
+        # Filtrar lecturas inválidas del DS18B20 (-127 = desconectado)
+        df = df[(df["agua"] > -50) & (df["agua"] < 150)]
+        df = df[(df["amb"] > -50) & (df["amb"] < 150)]
+        return df.reset_index(drop=True)
     except Exception as e:
         st.error(f"Error leyendo Supabase: {e}")
         return pd.DataFrame(columns=["t", "agua", "amb", "created_at"])
@@ -110,7 +113,10 @@ def calcular_dTdt(df):
     df = df.copy()
     dt = df["t"].diff()
     dT = df["agua"].diff()
-    df["dTdt"] = np.where(dt > 0, dT / dt, 0.0)
+    dTdt = np.where(dt > 0, dT / dt, 0.0)
+    # Limitar picos absurdos (p. ej. por saltos de sensor)
+    dTdt = np.clip(dTdt, -5.0, 5.0)
+    df["dTdt"] = dTdt
     df["dTdt"] = df["dTdt"].fillna(0.0)
     return df
 
@@ -128,9 +134,25 @@ def borrar_datos_supabase():
     if sb is None:
         return False, "No hay conexión a Supabase"
     try:
-        # Borra todas las filas (filtro que siempre es verdadero)
-        sb.table(TABLA).delete().neq("id", -1).execute()
-        return True, "Datos borrados correctamente"
+        # 1) Contar cuántos hay
+        antes = sb.table(TABLA).select("id", count="exact").execute()
+        n_antes = antes.count if antes.count is not None else len(antes.data or [])
+
+        # 2) Borrar con un filtro que cubre todas las filas
+        sb.table(TABLA).delete().gte("created_at", "1970-01-01").execute()
+
+        # 3) Verificar
+        despues = sb.table(TABLA).select("id", count="exact").execute()
+        n_despues = despues.count if despues.count is not None else len(despues.data or [])
+
+        if n_despues == 0:
+            return True, f"Datos borrados correctamente ({n_antes} filas eliminadas)"
+        else:
+            return False, (
+                f"Aún quedan {n_despues} filas. "
+                "Ejecuta en Supabase → SQL Editor:\n"
+                "create policy \"Permitir borrar\" on temperaturas for delete using (true);"
+            )
     except Exception as e:
         return False, str(e)
 
@@ -162,19 +184,21 @@ with st.sidebar:
     st.caption("Borra todos los puntos de la gráfica y deja el contador listo para empezar de 0 s.")
     confirmar = st.checkbox("Confirmo que quiero borrar los datos")
     if st.button("🗑️ Reiniciar datos (volver a 0 s)", type="primary", disabled=not confirmar):
-        ok, msg = borrar_datos_supabase()
+        with st.spinner("Borrando datos en Supabase…"):
+            ok, msg = borrar_datos_supabase()
         if ok:
             st.success(msg)
+            # Pequeña pausa para que el borrado se propague
+            time.sleep(0.8)
             st.rerun()
         else:
             st.error(f"No se pudo borrar: {msg}")
-            st.info(
-                "Si falla, añade esta política en Supabase → SQL Editor:\n\n"
-                "```sql\n"
+            st.code(
                 'create policy "Permitir borrar" on temperaturas\n'
-                "  for delete using (true);\n"
-                "```"
+                "  for delete using (true);",
+                language="sql"
             )
+            st.caption("Copia y ejecuta eso en Supabase → SQL Editor, luego vuelve a intentar.")
 
 # ---------- Modo Tiempo Real ----------
 if modo.startswith("Tiempo real"):
